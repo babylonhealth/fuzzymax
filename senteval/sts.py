@@ -1,26 +1,33 @@
-# Copyright (c) 2017-present, Facebook, Inc.
-# All rights reserved.
+# Copyright 2018 Babylon Partners. All Rights Reserved.
 #
-# This source code is licensed under the license found in the
-# LICENSE file in the root directory of this source tree.
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
 #
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ==============================================================================
+# This source code is derived from SentEval source code.
+# SentEval Copyright (c) 2017-present, Facebook, Inc.
+# ==============================================================================
 
 '''
-STS-{2012,2013,2014,2015,2016} (unsupervised) and
-STS-benchmark (supervised) tasks
+STS-{2012,2013,2014,2015,2016} (unsupervised)
 '''
 
 from __future__ import absolute_import, division, unicode_literals
 
-import os
 import io
 import numpy as np
 import logging
-
 from scipy.stats import spearmanr, pearsonr
-
+import scikits.bootstrap as bstrap
 from senteval.utils import cosine
-from senteval.sick import SICKRelatednessEval
 
 
 class STSEval(object):
@@ -51,15 +58,26 @@ class STSEval(object):
 
     def do_prepare(self, params, prepare):
         if 'similarity' in params:
-            self.similarity = params.similarity
+            self.similarity = lambda s1, s2: np.nan_to_num(
+                params.similarity(np.nan_to_num(s1), np.nan_to_num(s2)))
         else:  # Default similarity is cosine
-            self.similarity = lambda s1, s2: np.nan_to_num(cosine(np.nan_to_num(s1), np.nan_to_num(s2)))
+            self.similarity = lambda s1, s2: np.nan_to_num(
+                cosine(np.nan_to_num(s1), np.nan_to_num(s2)))
+
+        if self.compute_conf_intervals(params):
+            assert 'baseline_similarity' in params
+            self.baseline_similarity = lambda s1, s2: np.nan_to_num(
+                params.baseline_similarity(np.nan_to_num(s1), np.nan_to_num(s2)))
+
         return prepare(params, self.samples)
 
     def run(self, params, batcher):
+        seed = params.seed
+        np.random.seed(seed)
         results = {}
         for dataset in self.datasets:
             sys_scores = []
+            sys_scores_base = []
             input1, input2, gs_scores = self.data[dataset]
             for ii in range(0, len(gs_scores), params.batch_size):
                 batch1 = input1[ii:ii + params.batch_size]
@@ -70,22 +88,53 @@ class STSEval(object):
                     enc1 = batcher(params, batch1)
                     enc2 = batcher(params, batch2)
 
-                    for kk in range(enc2.shape[0]):
+                    for kk in range(len(enc2)):
                         sys_score = self.similarity(enc1[kk], enc2[kk])
                         sys_scores.append(sys_score)
+
+                        if self.compute_conf_intervals(params):
+                            sys_score_base = self.baseline_similarity(enc1[kk], enc2[kk])
+                            sys_scores_base.append(sys_score_base)
 
             results[dataset] = {'pearson': pearsonr(sys_scores, gs_scores),
                                 'spearman': spearmanr(sys_scores, gs_scores),
                                 'nsamples': len(sys_scores)}
-            logging.debug('%s : pearson = %.4f, spearman = %.4f' %
-                          (dataset, results[dataset]['pearson'][0],
-                           results[dataset]['spearman'][0]))
+
+            if self.compute_conf_intervals(params):
+                r_sys = pearsonr(gs_scores, sys_scores)[0]
+                r_sys_base = pearsonr(gs_scores, sys_scores_base)[0]
+
+                data = list(zip(gs_scores, sys_scores, sys_scores_base))
+
+                def statistic(data):
+                    gs = data[:, 0]
+                    sys = data[:, 1]
+                    sysb = data[:, 2]
+                    r1 = pearsonr(gs, sys)[0]
+                    r2 = pearsonr(gs, sysb)[0]
+                    return r1 - r2
+
+                conf_int = bstrap.ci(data, statfunction=statistic, method='bca')
+                results[dataset]['conf_int'] = {
+                    'delta': r_sys - r_sys_base,
+                    'conf_int': list(conf_int),
+                    'baseline': r_sys_base
+                }
+
+                logging.debug('%s : r  = %.4f, r base = %.4f, delta = %.4f, CI = [%.4f, %.4f]' %
+                              (dataset, r_sys, r_sys_base, r_sys - r_sys_base,
+                               conf_int[0], conf_int[1]))
+
+            else:
+                logging.debug('%s : pearson = %.4f, spearman = %.4f' %
+                              (dataset, results[dataset]['pearson'][0],
+                               results[dataset]['spearman'][0]))
 
         weights = [results[dset]['nsamples'] for dset in results.keys()]
         list_prs = np.array([results[dset]['pearson'][0] for
-                            dset in results.keys()])
+                             dset in results.keys()])
         list_spr = np.array([results[dset]['spearman'][0] for
-                            dset in results.keys()])
+                             dset in results.keys()])
 
         avg_pearson = np.average(list_prs)
         avg_spearman = np.average(list_spr)
@@ -102,6 +151,10 @@ class STSEval(object):
             Spearman = %.4f\n' % (avg_pearson, avg_spearman))
 
         return results
+
+    @staticmethod
+    def compute_conf_intervals(params):
+        return 'conf_intervals' in params and params['conf_intervals']
 
 
 class STS12Eval(STSEval):
@@ -147,25 +200,3 @@ class STS16Eval(STSEval):
         self.datasets = ['answer-answer', 'headlines', 'plagiarism',
                          'postediting', 'question-question']
         self.loadFile(taskpath)
-
-
-class STSBenchmarkEval(SICKRelatednessEval):
-    def __init__(self, task_path, seed=1111):
-        logging.debug('\n\n***** Transfer task : STSBenchmark*****\n\n')
-        self.seed = seed
-        train = self.loadFile(os.path.join(task_path, 'sts-train.csv'))
-        dev = self.loadFile(os.path.join(task_path, 'sts-dev.csv'))
-        test = self.loadFile(os.path.join(task_path, 'sts-test.csv'))
-        self.sick_data = {'train': train, 'dev': dev, 'test': test}
-
-    def loadFile(self, fpath):
-        sick_data = {'X_A': [], 'X_B': [], 'y': []}
-        with io.open(fpath, 'r', encoding='utf-8') as f:
-            for line in f:
-                text = line.strip().split('\t')
-                sick_data['X_A'].append(text[5].split())
-                sick_data['X_B'].append(text[6].split())
-                sick_data['y'].append(text[4])
-
-        sick_data['y'] = [float(s) for s in sick_data['y']]
-        return sick_data
